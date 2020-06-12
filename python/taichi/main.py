@@ -165,6 +165,42 @@ class TaichiMain:
         runpy.run_path(target, run_name='__main__')
 
     @register
+    def changelog(self, arguments: list = sys.argv[2:]):
+        """Display changelog of current version"""
+        parser = argparse.ArgumentParser(
+            prog='ti changelog', description=f"{self.changelog.__doc__}")
+        import taichi as ti
+        if ti.is_release():
+            args = parser.parse_args(arguments)
+            changelog_md = os.path.join(ti.package_root(), 'CHANGELOG.md')
+            with open(changelog_md) as f:
+                print(f.read())
+        else:
+            parser.add_argument(
+                'version',
+                nargs='?',
+                type=str,
+                default='master',
+                help="A version (tag) that git can use to compare diff with")
+            parser.add_argument(
+                '-s',
+                '--save',
+                action='store_true',
+                help="Save changelog to CHANGELOG.md instead of print to stdout"
+            )
+            args = parser.parse_args(arguments)
+
+            from . import make_changelog
+            res = make_changelog.main(args.version, ti.core.get_repo_dir())
+            if args.save:
+                changelog_md = os.path.join(ti.core.get_repo_dir(),
+                                            'CHANGELOG.md')
+                with open(changelog_md, 'w') as f:
+                    f.write(res)
+            else:
+                print(res)
+
+    @register
     def release(self, arguments: list = sys.argv[2:]):
         """Make source code release"""
         parser = argparse.ArgumentParser(prog='ti release',
@@ -366,7 +402,8 @@ class TaichiMain:
         args = parser.parse_args(arguments)
 
         if not args.inputs:
-            args.inputs = [str(p.resolve()) for p in Path('.').glob('*.png')]
+            args.inputs = sorted(
+                str(p.resolve()) for p in Path('.').glob('*.png'))
 
         ti.info(f'Making video using {len(args.inputs)} png files...')
         ti.info(f'frame_rate = {args.framerate}')
@@ -446,15 +483,16 @@ class TaichiMain:
     def _display_benchmark_regression(xd, yd, args):
         def parse_dat(file):
             dict = {}
-            for line in open(file).readlines():
-                try:
-                    a, b = line.strip().split(':')
-                except:
-                    continue
-                b = float(b)
-                if abs(b % 1.0) < 1e-5:  # codegen_*
-                    b = int(b)
-                dict[a.strip()] = b
+            with open(file) as f:
+                for line in f.readlines():
+                    try:
+                        a, b = line.strip().split(':')
+                    except:
+                        continue
+                    b = float(b)
+                    if abs(b % 1.0) < 1e-5:  # codegen_*
+                        b = int(b)
+                    dict[a.strip()] = b
             return dict
 
         def parse_name(file):
@@ -618,35 +656,29 @@ class TaichiMain:
         if args.verbose:
             pytest_args += ['-s', '-v']
         if args.rerun:
-            if int(
-                    pytest.main([
-                        os.path.join(root_dir, 'misc/empty_pytest.py'),
-                        '--reruns', '2', '-q'
-                    ])) != 0:
-                sys.exit(
-                    "Plugin pytest-rerunfailures is not available for Pytest!")
             pytest_args += ['--reruns', args.rerun]
-        # TODO: configure the parallel test runner in setup.py
-        # follow https://docs.pytest.org/en/latest/example/simple.html#dynamically-adding-command-line-options
-        if int(
-                pytest.main([
-                    os.path.join(root_dir, 'misc/empty_pytest.py'), '-n1', '-q'
-                ])) == 0:  # test if pytest has xdist or not
-            try:
-                from multiprocessing import cpu_count
-                threads = min(8,
-                              cpu_count())  # To prevent running out of memory
-            except NotImplementedError:
-                threads = 2
+        try:
+            if args.coverage:
+                pytest_args += ['--cov-branch', '--cov=python/taichi']
+            if args.cov_append:
+                pytest_args += ['--cov-append']
+        except AttributeError:
+            pass
+
+        try:
+            from multiprocessing import cpu_count
+            threads = min(8, cpu_count())  # To prevent running out of memory
+        except NotImplementedError:
+            threads = 2
+
+        if not os.environ.get('TI_DEVICE_MEMORY_GB'):
             os.environ['TI_DEVICE_MEMORY_GB'] = '0.5'  # Discussion: #769
 
-            env_threads = os.environ.get('TI_TEST_THREADS', '')
-            threads = args.threads or env_threads or threads
-            print(f'Starting {threads} testing thread(s)...')
-            if int(threads) > 1:
-                pytest_args += ['-n', str(threads)]
-        else:
-            print("[Warning] Plugin pytest-xdist is not available for Pytest!")
+        env_threads = os.environ.get('TI_TEST_THREADS', '')
+        threads = args.threads or env_threads or threads
+        print(f'Starting {threads} testing thread(s)...')
+        if int(threads) > 1:
+            pytest_args += ['-n', str(threads)]
         return int(pytest.main(pytest_args))
 
     @staticmethod
@@ -738,6 +770,22 @@ class TaichiMain:
                             dest='rerun',
                             type=str,
                             help='Rerun failed tests for given times')
+        parser.add_argument('-C',
+                            '--coverage',
+                            required=False,
+                            default=None,
+                            dest='coverage',
+                            action='store_true',
+                            help='Run tests and record the coverage result')
+        parser.add_argument(
+            '-A',
+            '--cov-append',
+            required=False,
+            default=None,
+            dest='cov_append',
+            action='store_true',
+            help=
+            'Append coverage result to existing one instead of overriding it')
         parser.add_argument(
             '-t',
             '--threads',

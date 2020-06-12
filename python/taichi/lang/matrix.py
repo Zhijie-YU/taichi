@@ -3,9 +3,10 @@ from . import impl
 import copy
 import numbers
 import numpy as np
-from .util import *
+from .util import taichi_scope, python_scope, deprecated, to_numpy_type, to_pytorch_type, in_python_scope
 from .common_ops import TaichiOperations
 from collections.abc import Iterable
+import warnings
 
 
 class Matrix(TaichiOperations):
@@ -25,38 +26,33 @@ class Matrix(TaichiOperations):
                  keep_raw=False,
                  rows=None,
                  cols=None):
-        # TODO: refactor: use multiple initializer like `ti.Matrix.cols([a, b, c])`
-        # and `ti.Matrix.empty(n, m)` instead of ad-hoc `ti.Matrix(cols=[a, b, c])`.
         self.grad = None
+        # construct from rows or cols
         if rows is not None or cols is not None:
+            warnings.warn(
+                f"ti.Matrix(rows=[...]) or ti.Matrix(cols=[...]) is deprecated, use ti.Matrix.rows([...]) or ti.Matrix.cols([...]) instead.",
+                DeprecationWarning,
+                stacklevel=3)
             if rows is not None and cols is not None:
                 raise Exception("cannot specify both rows and columns")
-            if cols is not None:
-                rows = cols
-            self.n = len(rows)
-            if isinstance(rows[0], Matrix):
-                for row in rows:
-                    assert row.m == 1, "inputs must be vectors, ie. size n by 1"
-                    assert row.n == rows[
-                        0].n, "input vectors must be the same shape"
-                self.m = rows[0].n
-                # l-value copy:
-                self.entries = [row(i) for row in rows for i in range(row.n)]
-            elif isinstance(rows[0], list):
-                for row in rows:
-                    assert len(row) == len(
-                        rows[0]), "input lists must be the same shape"
-                self.m = len(rows[0])
-                # l-value copy:
-                self.entries = [x for row in rows for x in row]
-            else:
-                raise Exception(
-                    "rows/cols must be list of lists or lists of vectors")
-            if cols is not None:
-                t = self.transpose()
-                self.n = t.n
-                self.m = t.m
-                self.entries = t.entries
+            self.dt = dt
+            import taichi as ti
+            mat = ti.Matrix.cols(cols) if cols is not None else ti.Matrix.rows(
+                rows)
+            self.n = mat.n
+            self.m = mat.m
+            self.entries = mat.entries
+            return
+
+        elif empty == True:
+            warnings.warn(
+                f"ti.Matrix(n, m, empty=True) is deprecated, use ti.Matrix.empty(n, m) instead",
+                DeprecationWarning,
+                stacklevel=3)
+            self.dt = dt
+            self.entries = [[None] * m for _ in range(n)]
+            return
+
         elif isinstance(n, (list, tuple, np.ndarray)):
             if len(n) == 0:
                 mat = []
@@ -64,7 +60,7 @@ class Matrix(TaichiOperations):
                 raise Exception(
                     'cols/rows required when using list of vectors')
             elif not isinstance(n[0], Iterable):
-                if impl.get_runtime().inside_kernel:
+                if impl.inside_kernel():
                     # wrap potential constants with Expr
                     if keep_raw:
                         mat = [list([x]) for x in n]
@@ -80,22 +76,20 @@ class Matrix(TaichiOperations):
             else:
                 self.m = 1
             self.entries = [x for row in mat for x in row]
+        # construct global matrix
         else:
             self.entries = []
             self.n = n
             self.m = m
             self.dt = dt
-            if empty:
-                self.entries = [None] * n * m
+            if dt is None:
+                for i in range(n * m):
+                    self.entries.append(impl.expr_init(None))
             else:
-                if dt is None:
-                    for i in range(n * m):
-                        self.entries.append(impl.expr_init(None))
-                else:
-                    assert not impl.inside_kernel()
-                    for i in range(n * m):
-                        self.entries.append(impl.var(dt))
-                    self.grad = self.make_grad()
+                assert not impl.inside_kernel()
+                for i in range(n * m):
+                    self.entries.append(impl.var(dt))
+                self.grad = self.make_grad()
 
         if layout is not None:
             assert shape is not None, 'layout is useless without shape'
@@ -140,9 +134,16 @@ class Matrix(TaichiOperations):
             if isinstance(e, expr.Expr):
                 if e.ptr.is_global_var():
                     results[i] = True
-            assert results[i] == results[
-                0], "Matrices with mixed global/local entries are not allowed"
+            assert results[i] == results[0], \
+                "Matrices with mixed global/local entries are not allowed"
         return results[0]
+
+    def is_pyconstant(self):
+        return all([not isinstance(e, expr.Expr) for e in self.entries])
+
+    @staticmethod
+    def make_from_numpy(nparray):
+        return Matrix(nparray)
 
     @taichi_scope
     def element_wise_binary(self, foo, other):
@@ -155,7 +156,7 @@ class Matrix(TaichiOperations):
                 f'taichi class {type(a)}, maybe you want to use `a.fill(b)` instead?'
             )
         if isinstance(other, Matrix):
-            assert self.m == other.m and self.n == other.n
+            assert self.m == other.m and self.n == other.n, f"Dimension mismatch between shapes ({self.n}, {self.m}), ({other.n}, {other.m})"
             for i in range(self.n * self.m):
                 ret.entries[i] = foo(self.entries[i], other.entries[i])
         else:  # assumed to be scalar
@@ -171,9 +172,12 @@ class Matrix(TaichiOperations):
             ret.entries[i] = foo(self.entries[i])
         return ret
 
-    @taichi_scope
     def __matmul__(self, other):
-        assert self.m == other.n
+        # TODO: move to common_ops.py, redirect to `ti.matmul` too?
+        if self.is_pyconstant() and in_python_scope():
+            return self.make_from_numpy(self.to_numpy() @ other.to_numpy())
+
+        assert self.m == other.n, f"Dimension mismatch between shapes ({self.n}, {self.m}), ({other.n}, {other.m})"
         ret = Matrix(self.n, other.m)
         for i in range(self.n):
             for j in range(other.m):
@@ -289,6 +293,7 @@ class Matrix(TaichiOperations):
 
     class Proxy:
         def __init__(self, mat, index):
+            """Proxy when a tensor of Matrices is accessed by host."""
             self.mat = mat
             self.index = index
 
@@ -338,11 +343,6 @@ class Matrix(TaichiOperations):
     @python_scope
     def __getitem__(self, index):
         return Matrix.Proxy(self, index)
-        ret = [[] for _ in range(self.n)]
-        for i in range(self.n):
-            for j in range(self.m):
-                ret[i].append(self(i, j)[index])
-        return ret
 
     # host access
     @python_scope
@@ -353,8 +353,17 @@ class Matrix(TaichiOperations):
             for j in range(self.m):
                 self(i, j)[index] = item[i][j]
 
+    # host access, return a complete Matrix instead of Proxy
+    def at(self, index):
+        ret = self.empty_copy()
+        for i in range(self.n):
+            for j in range(self.m):
+                ret.entries[i * self.m + j] = self[index][i, j]
+        return ret
+
     def empty_copy(self):
-        return Matrix(self.n, self.m, empty=True)
+        import taichi as ti
+        return ti.Matrix.empty(self.n, self.m)
 
     def zeros_copy(self):
         return Matrix(self.n, self.m)
@@ -464,7 +473,7 @@ class Matrix(TaichiOperations):
 
     @taichi_scope
     def transpose(a):
-        ret = Matrix(a.m, a.n, empty=True)
+        ret = Matrix.empty(a.m, a.n)
         for i in range(a.n):
             for j in range(a.m):
                 ret.set_entry(j, i, a(i, j))
@@ -615,8 +624,12 @@ class Matrix(TaichiOperations):
                 DeprecationWarning,
                 stacklevel=3)
         as_vector = self.m == 1 and not keep_dims
-        dim_ext = (self.n, ) if as_vector else (self.n, self.m)
-        ret = np.empty(self.loop_range().shape() + dim_ext,
+        shape_ext = (self.n, ) if as_vector else (self.n, self.m)
+
+        if self.is_pyconstant():
+            return np.array(self.entries).reshape(shape_ext)
+
+        ret = np.empty(self.loop_range().shape() + shape_ext,
                        dtype=to_numpy_type(
                            self.loop_range().snode().data_type()))
         from .meta import matrix_to_ext_arr
@@ -629,8 +642,8 @@ class Matrix(TaichiOperations):
     def to_torch(self, device=None, keep_dims=False):
         import torch
         as_vector = self.m == 1 and not keep_dims
-        dim_ext = (self.n, ) if as_vector else (self.n, self.m)
-        ret = torch.empty(self.loop_range().shape() + dim_ext,
+        shape_ext = (self.n, ) if as_vector else (self.n, self.m)
+        ret = torch.empty(self.loop_range().shape() + shape_ext,
                           dtype=to_pytorch_type(
                               self.loop_range().snode().data_type()),
                           device=device)
@@ -677,6 +690,10 @@ class Matrix(TaichiOperations):
         if self.m != 1:
             yield ']'
 
+    def __repr__(self):
+        """Python scope object print support."""
+        return str(self.to_numpy())
+
     @staticmethod
     @taichi_scope
     def zero(dt, n, m=1):
@@ -713,6 +730,47 @@ class Matrix(TaichiOperations):
         import taichi as ti
         return ti.Matrix([[ti.cos(alpha), -ti.sin(alpha)],
                           [ti.sin(alpha), ti.cos(alpha)]])
+
+    @staticmethod
+    def var(n, m, dt, **kwargs):
+        import taichi as ti
+        return ti.Matrix(n=n, m=m, dt=dt, **kwargs)
+
+    @staticmethod
+    def rows(rows):
+        import taichi as ti
+        mat = ti.Matrix()
+        mat.n = len(rows)
+        if isinstance(rows[0], Matrix):
+            for row in rows:
+                assert row.m == 1, "Inputs must be vectors, i.e. m == 1"
+                assert row.n == rows[
+                    0].n, "Input vectors must share the same shape"
+            mat.m = rows[0].n
+            # l-value copy:
+            mat.entries = [row(i) for row in rows for i in range(row.n)]
+        elif isinstance(rows[0], list):
+            for row in rows:
+                assert len(row) == len(
+                    rows[0]), "Input lists share the same shape"
+            mat.m = len(rows[0])
+            # l-value copy:
+            mat.entries = [x for row in rows for x in row]
+        else:
+            raise Exception(
+                "Cols/rows must be a list of lists, or a list of vectors")
+        return mat
+
+    @staticmethod
+    def cols(cols):
+        import taichi as ti
+        return ti.Matrix.rows(cols).transpose()
+
+    @staticmethod
+    def empty(n, m):
+        import taichi as ti
+        mat = ti.Matrix([[None] * m for _ in range(n)])
+        return mat
 
     def __hash__(self):
         # TODO: refactor KernelTemplateMapper

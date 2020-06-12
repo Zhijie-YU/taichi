@@ -3,8 +3,11 @@
 #include "taichi/math/math.h"
 #include "taichi/system/timer.h"
 #include "taichi/program/profiler.h"
+
+#include <atomic>
 #include <ctime>
 #include <numeric>
+#include <unordered_map>
 
 #if defined(TI_PLATFORM_LINUX)
 #define TI_GUI_X11
@@ -428,6 +431,7 @@ class GUIBaseX11 {
   void *visual;
   unsigned long window;
   CXImage *img;
+  std::vector<char> wmDeleteMessage;
 };
 
 using GUIBase = GUIBaseX11;
@@ -453,6 +457,15 @@ class GUIBaseCocoa {
   id window, view;
   std::size_t img_data_length;
   std::vector<uint8_t> img_data;
+  std::atomic_bool window_received_close = false;
+  // Some key are called *modifier keys* and are not detected by regular key
+  // events in Cocoa. Instead, they will trigger a flags changed event.
+  // https://developer.apple.com/documentation/appkit/nseventtype/nseventtypeflagschanged?language=objc
+  //
+  // We have to:
+  // 1. check [event modifierFlags] to retrieve the key code,
+  // 2. maintain the press/released events on our own.
+  std::unordered_map<std::string, bool> active_modifier_flags;
 };
 
 using GUIBase = GUIBaseCocoa;
@@ -470,6 +483,7 @@ class GUI : public GUIBase {
   std::unique_ptr<Canvas> canvas;
   float64 last_frame_time;
   bool key_pressed;
+  int should_close{0};
   std::vector<std::string> log_entries;
   Vector2i cursor_pos;
   bool button_status[3];
@@ -705,6 +719,12 @@ class GUI : public GUIBase {
 
   void process_event();
 
+  void send_window_close_message() {
+    key_events.push_back(
+        GUI::KeyEvent{GUI::KeyEvent::Type::press, "WMClose", cursor_pos});
+    should_close++;
+  }
+
   void mouse_event(MouseEvent e) {
     if (e.type == MouseEvent::Type::press) {
       button_status[0] = true;
@@ -777,6 +797,18 @@ class GUI : public GUIBase {
     }
     last_frame_time = taichi::Time::get_time();
     redraw();
+    // Some old examples / users don't even provide a `break` statement for us
+    // to terminate loop. So we have to terminate the program with RuntimeError
+    // if ti.GUI.EXIT event is not processed. Pretty like SIGTERM, you can hook
+    // it, but you have to terminate after your handler is done.
+    if (should_close) {
+      if (++should_close > 5) {
+        // if the event is not processed in 5 frames, raise RuntimeError
+        throw std::string(
+            "Window close button clicked, exiting... (use `while gui.running` "
+            "to exit gracefully)");
+      }
+    }
     process_event();
     while (last_frame_interval.size() > 30) {
       last_frame_interval.erase(last_frame_interval.begin());

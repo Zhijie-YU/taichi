@@ -81,22 +81,12 @@ void compile_to_offloads(IRNode *ir,
   print("Store forwarded");
   irpass::analysis::verify(ir);
 
-  if (lower_global_access) {
-    irpass::lower_access(ir, true);
-    print("Access lowered");
-    irpass::analysis::verify(ir);
-
-    irpass::die(ir);
-    print("DIE");
-    irpass::analysis::verify(ir);
-  }
+  irpass::flag_access(ir);
+  print("Access flagged I");
+  irpass::analysis::verify(ir);
 
   irpass::full_simplify(ir);
   print("Simplified II");
-  irpass::analysis::verify(ir);
-
-  irpass::flag_access(ir);
-  print("Access flagged");
   irpass::analysis::verify(ir);
 
   irpass::constant_fold(ir);
@@ -106,9 +96,21 @@ void compile_to_offloads(IRNode *ir,
   print("Offloaded");
   irpass::analysis::verify(ir);
 
-  if (!lower_global_access) {
+  irpass::flag_access(ir);
+  print("Access flagged II");
+  irpass::analysis::verify(ir);
+
+  if (lower_global_access) {
+    irpass::lower_access(ir, true);
+    print("Access lowered");
+    irpass::analysis::verify(ir);
+
+    irpass::die(ir);
+    print("DIE");
+    irpass::analysis::verify(ir);
+
     irpass::flag_access(ir);
-    print("Access flagged after offloading");
+    print("Access flagged III");
     irpass::analysis::verify(ir);
   }
 
@@ -119,6 +121,12 @@ void compile_to_offloads(IRNode *ir,
   print("Atomics demoted");
   irpass::analysis::verify(ir);
 
+  irpass::full_simplify(ir);
+  print("Simplified III");
+
+  irpass::extract_constant(ir);
+  print("Constant extracted III");
+
   irpass::variable_optimization(ir, true);
   print("Store forwarded II");
 
@@ -127,7 +135,7 @@ void compile_to_offloads(IRNode *ir,
   irpass::analysis::verify(ir);
 
   irpass::full_simplify(ir);
-  print("Simplified III");
+  print("Simplified IV");
 
   // Final field registration correctness & type checking
   irpass::typecheck(ir);

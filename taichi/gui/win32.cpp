@@ -4,6 +4,7 @@
 #include <windowsx.h>
 #include "taichi/common/task.h"
 #include "taichi/gui/gui.h"
+#include <cctype>
 #include <map>
 
 // Note: some code is copied from MSDN:
@@ -53,7 +54,7 @@ static std::string lookup_keysym(WPARAM wParam, LPARAM lParam) {
       if (VK_F1 <= key && key <= VK_F12)
         return fmt::format("F{}", key - VK_F1);
       else if (isascii(key))
-        return std::string(1, key);
+        return std::string(1, std::tolower(key));
       else
         return fmt::format("Vk{}", key);
   }
@@ -68,10 +69,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd,
   using namespace taichi;
   int x, y;
   switch (uMsg) {
-    case WM_DESTROY:
-      PostQuitMessage(0);
-      exit(0);
-      return 0;
     case WM_LBUTTONDOWN:
       gui->mouse_event(
           GUI::MouseEvent{GUI::MouseEvent::Type::press, gui->cursor_pos});
@@ -121,7 +118,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd,
                                               gui->cursor_pos});
       break;
     case WM_CLOSE:
-      exit(0);
+      // https://stackoverflow.com/questions/3155782/what-is-the-difference-between-wm-quit-wm-close-and-wm-destroy-in-a-windows-pr
+      gui->send_window_close_message();
       break;
   }
   return DefWindowProc(hwnd, uMsg, wParam, lParam);
@@ -131,7 +129,7 @@ TI_NAMESPACE_BEGIN
 
 void GUI::process_event() {
   MSG msg;
-  if (PeekMessage(&msg, hwnd, 0, 0, PM_REMOVE)) {
+  if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
     TranslateMessage(&msg);
     DispatchMessage(&msg);
   }
@@ -148,13 +146,23 @@ void GUI::create_window() {
 
   RegisterClass(&wc);
 
+  RECT window_rect;
+  window_rect.left = 0;
+  window_rect.right = width;
+  window_rect.top = 0;
+  window_rect.bottom = height;
+
+  AdjustWindowRect(&window_rect, WS_OVERLAPPEDWINDOW, false);
+
   hwnd = CreateWindowEx(0,           // Optional window styles.
                         CLASS_NAME,  // Window class
                         std::wstring(window_name.begin(), window_name.end())
                             .data(),          // Window text
                         WS_OVERLAPPEDWINDOW,  // Window style
                         // Size and position
-                        CW_USEDEFAULT, CW_USEDEFAULT, width + 16, height + 32,
+                        CW_USEDEFAULT, CW_USEDEFAULT,
+                        window_rect.right - window_rect.left,
+                        window_rect.bottom - window_rect.top,
                         NULL,                // Parent window
                         NULL,                // Menu
                         GetModuleHandle(0),  // Instance handle
@@ -179,9 +187,10 @@ void GUI::redraw() {
   for (int i = 0; i < width; i++) {
     for (int j = 0; j < height; j++) {
       auto c = reinterpret_cast<unsigned char *>(data + (j * width) + i);
-      c[0] = (unsigned char)(canvas->img[i][height - j - 1][2] * 255.0_f);
-      c[1] = (unsigned char)(canvas->img[i][height - j - 1][1] * 255.0_f);
-      c[2] = (unsigned char)(canvas->img[i][height - j - 1][0] * 255.0_f);
+      auto d = canvas->img[i][height - j - 1];
+      c[0] = uint8(clamp(int(d[2] * 255.0_f), 0, 255));
+      c[1] = uint8(clamp(int(d[1] * 255.0_f), 0, 255));
+      c[2] = uint8(clamp(int(d[0] * 255.0_f), 0, 255));
       c[3] = 0;
     }
   }
