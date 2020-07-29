@@ -1,13 +1,17 @@
 from .core import taichi_lang_core
+from taichi.misc.util import warning, deprecated
 import numpy as np
+import os
 
 _has_pytorch = False
 
-try:
-    import torch
-    _has_pytorch = True
-except:
-    pass
+_env_torch = os.environ.get('TI_ENABLE_TORCH', '1')
+if not _env_torch or int(_env_torch):
+    try:
+        import torch
+        _has_pytorch = True
+    except:
+        pass
 
 
 def has_pytorch():
@@ -162,22 +166,6 @@ def to_taichi_type(dt):
     raise AssertionError("Unknown type {}".format(dt))
 
 
-def deprecated(old, new):
-    import functools
-
-    def decorator(foo):
-        @functools.wraps(foo)
-        def wrapped(*args, **kwargs):
-            import warnings
-            msg = f'{old} is deprecated, please use {new} instead'
-            warnings.warn(msg, DeprecationWarning, stacklevel=2)
-            return foo(*args, **kwargs)
-
-        return wrapped
-
-    return decorator
-
-
 def in_taichi_scope():
     from . import impl
     return impl.inside_kernel()
@@ -192,6 +180,7 @@ def taichi_scope(func):
 
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
+        _taichi_skip_traceback = 1
         assert in_taichi_scope(), \
                 f'{func.__name__} cannot be called in Python-scope'
         return func(*args, **kwargs)
@@ -204,6 +193,7 @@ def python_scope(func):
 
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
+        _taichi_skip_traceback = 1
         assert in_python_scope(), \
                 f'{func.__name__} cannot be called in Taichi-scope'
         return func(*args, **kwargs)

@@ -2,7 +2,7 @@
 
 #include "taichi/math/math.h"
 #include "taichi/system/timer.h"
-#include "taichi/program/profiler.h"
+#include "taichi/program/kernel_profiler.h"
 
 #include <atomic>
 #include <ctime>
@@ -380,6 +380,13 @@ class Canvas {
 
   void triangle(Vector2 a, Vector2 b, Vector2 c, Vector4 color);
 
+  void triangles_batched(int n,
+                         std::size_t a_,
+                         std::size_t b_,
+                         std::size_t c_,
+                         uint32 color_single,
+                         std::size_t color_array);
+
   void triangle_single(real x0,
                        real y0,
                        real x1,
@@ -488,7 +495,7 @@ class GUI : public GUIBase {
   Vector2i cursor_pos;
   bool button_status[3];
   int widget_height;
-  lang::ProfilerBase *profiler;
+  std::vector<std::unique_ptr<float>> widget_values;
 
   void set_mouse_pos(int x, int y) {
     cursor_pos = Vector2i(x, y);
@@ -508,6 +515,7 @@ class GUI : public GUIBase {
     Type type;
     std::string key;
     Vector2i pos;
+    Vector2i delta;
   };
 
   std::vector<KeyEvent> key_events;
@@ -830,16 +838,8 @@ class GUI : public GUIBase {
     }
   }
 
-  std::string get_key_event_head_key() {
-    return key_events[0].key;
-  }
-
-  bool get_key_event_head_type() {
-    return key_events[0].type == KeyEvent::Type::press;
-  }
-
-  Vector2 get_key_event_head_pos() {
-    return canvas->untransform(Vector2(key_events[0].pos));
+  KeyEvent get_key_event_head() {
+    return key_events[0];
   }
 
   Vector2 get_cursor_pos() {
@@ -858,6 +858,10 @@ class GUI : public GUIBase {
         break;
       }
     }
+  }
+
+  Vector2 canvas_untransform(Vector2i pos) {
+    return canvas->untransform(Vector2(pos));
   }
 
   void draw_log() {
@@ -886,10 +890,6 @@ class GUI : public GUIBase {
   }
 
   ~GUI();
-
-  void set_profiler(lang::ProfilerBase *profiler) {
-    this->profiler = profiler;
-  }
 };
 
 TI_NAMESPACE_END

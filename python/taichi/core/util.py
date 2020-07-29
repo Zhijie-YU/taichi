@@ -3,18 +3,14 @@ import re
 import shutil
 import sys
 import ctypes
-import warnings
 from pathlib import Path
 from colorama import Fore, Back, Style
-from taichi.misc.settings import get_output_directory, get_build_directory, get_bin_directory, get_repo_directory, get_runtime_directory
-from taichi.misc.util import get_os_name, get_unique_task_id
+from .settings import *
 
 if sys.version_info[0] < 3 or sys.version_info[1] <= 5:
     print("\nPlease restart with Python 3.6+\n")
     print("Current Python version:", sys.version_info)
     exit(-1)
-
-warnings.filterwarnings('always')
 
 ti_core = None
 
@@ -30,7 +26,7 @@ def import_ti_core(tmp_dir=None):
     global ti_core
     if get_os_name() != 'win':
         old_flags = sys.getdlopenflags()
-        sys.setdlopenflags(258)  # 258 = RTLD_NOW | RTLD_GLOBAL
+        sys.setdlopenflags(2 | 8)  # RTLD_NOW | RTLD_DEEPBIND
     else:
         pyddir = os.path.join(package_root(), 'lib')
         os.environ['PATH'] += ';' + pyddir
@@ -56,10 +52,9 @@ def import_ti_core(tmp_dir=None):
 def locale_encode(s):
     try:
         import locale
-        encoding = locale.getdefaultlocale()[1]
-    except:
-        encoding = 'utf8'
-    return s.encode(encoding)
+        return s.encode(locale.getdefaultlocale()[1])
+    except TypeError:
+        return s.encode('utf8')
 
 
 def is_ci():
@@ -249,9 +244,16 @@ def build():
     os.chdir(tmp_cwd)
 
 
+def check_exists(src):
+    if not os.path.exists(src):
+        raise FileNotFoundError(
+            f'File "{src}" not exist. Installation corrupted or build incomplete?'
+        )
+
+
 def prepare_sandbox(src):
     global g_tmp_dir
-    assert os.path.exists(src)
+    check_exists(src)
     import atexit
     import shutil
     from tempfile import mkdtemp
@@ -262,6 +264,13 @@ def prepare_sandbox(src):
     shutil.copy(src, dest)
     os.mkdir(os.path.join(tmp_dir, 'runtime/'))
     return tmp_dir
+
+
+def get_unique_task_id():
+    import datetime
+    import random
+    return datetime.datetime.now().strftime('task-%Y-%m-%d-%H-%M-%S-r') + (
+        '%05d' % random.randint(0, 10000))
 
 
 if is_release():
@@ -275,7 +284,7 @@ if is_release():
             os.symlink(link_src, link_dst)
     import_ti_core()
     if get_os_name() != 'win':
-        dll = ctypes.CDLL(get_core_shared_object(), mode=ctypes.RTLD_GLOBAL)
+        dll = ctypes.CDLL(get_core_shared_object(), mode=ctypes.RTLD_LOCAL)
 
     ti_core.set_python_package_dir(package_root())
     os.makedirs(ti_core.get_repo_dir(), exist_ok=True)
@@ -299,7 +308,7 @@ else:
         else:
             os.environ['LD_LIBRARY_PATH'] = '/usr/lib64/'
         lib_path = os.path.join(bin_dir, 'libtaichi_core.so')
-        assert os.path.exists(lib_path)
+        check_exists(lib_path)
         tmp_cwd = os.getcwd()
         tmp_dir = prepare_sandbox(lib_path)
         os.chdir(tmp_dir)
@@ -382,7 +391,7 @@ def get_dll_name(name):
     elif get_os_name() == 'win':
         return 'taichi_%s.dll' % name
     else:
-        assert False, "Unknown OS"
+        raise Exception(f"Unknown OS: {get_os_name()}")
 
 
 def load_module(name, verbose=True):
@@ -468,17 +477,8 @@ def _print_taichi_header():
     else:
         header += f'version {ti_core.get_version_string()}, '
 
-    supported_archs = ['cpu']
-    if ti_core.with_cuda():
-        supported_archs.append('cuda')
-    if ti_core.with_opengl():
-        supported_archs.append('opengl')
-    if ti_core.with_metal():
-        supported_archs.append('metal')
-    if len(supported_archs) == 1:
-        supported_archs[0] = 'cpu only'
-    archs_str = ', '.join(sorted(supported_archs))
-    header += f'supported archs: [{archs_str}], '
+    llvm_version = ti_core.get_llvm_version_string()
+    header += f'llvm {llvm_version}, '
 
     commit_hash = ti_core.get_commit_hash()
     commit_hash = commit_hash[:8]
@@ -491,3 +491,14 @@ def _print_taichi_header():
 
 
 _print_taichi_header()
+
+__all__ = [
+    'ti_core',
+    'build',
+    'format',
+    'load_module',
+    'start_memory_monitoring',
+    'is_release',
+    'package_root',
+    'require_version',
+]

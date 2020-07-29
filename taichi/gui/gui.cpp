@@ -4,6 +4,26 @@ TI_NAMESPACE_BEGIN
 
 Vector2 Canvas::Line::vertices[128];
 
+void Canvas::triangles_batched(int n,
+                               std::size_t a_,
+                               std::size_t b_,
+                               std::size_t c_,
+                               uint32 color_single,
+                               std::size_t color_array) {
+  auto a = (real *)a_;
+  auto b = (real *)b_;
+  auto c = (real *)c_;
+  auto color_arr = (uint32 *)color_array;
+  for (int i = 0; i < n; i++) {
+    auto clr = color_single;
+    if (color_arr) {
+      clr = color_arr[i];
+    }
+    triangle_single(a[i * 2], a[i * 2 + 1], b[i * 2], b[i * 2 + 1], c[i * 2],
+                    c[i * 2 + 1], clr);
+  }
+}
+
 void Canvas::circles_batched(int n,
                              std::size_t x_,
                              uint32 color_single,
@@ -61,7 +81,11 @@ void Canvas::triangle(Vector2 a, Vector2 b, Vector2 c, Vector4 color) {
       bool inside_a = cross(pixel - a, b - a) <= 0;
       bool inside_b = cross(pixel - b, c - b) <= 0;
       bool inside_c = cross(pixel - c, a - c) <= 0;
-      if (inside_a && inside_b && inside_c && img.inside(i, j)) {
+
+      // cover both clockwise and counterclockwise case for vertices [a, b, c]
+      bool inside_triangle = (inside_a == inside_b) && (inside_a == inside_c);
+
+      if (inside_triangle && img.inside(i, j)) {
         img[i][j] = color;
       }
     }

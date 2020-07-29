@@ -23,7 +23,7 @@ using host_vsnprintf_type = int (*)(char *,
                                     const char *,
                                     std::va_list);
 using vm_allocator_type = void *(*)(void *, std::size_t, std::size_t);
-using RangeForTaskFunc = void(Context *, int i);
+using RangeForTaskFunc = void(Context *, const char *tls, int i);
 using parallel_for_type = void (*)(void *thread_pool,
                                    int splits,
                                    int num_desired_threads,
@@ -82,8 +82,22 @@ using Ptr = uint8 *;
 
 using ContextArgType = long long;
 
+#if ARCH_cuda
+extern "C" {
+
+void __assertfail(const char *message,
+                  const char *file,
+                  i32 line,
+                  const char *function,
+                  std::size_t charSize);
+};
+#endif
+
 template <typename T>
 void locked_task(void *lock, const T &func);
+
+template <typename T, typename G>
+void locked_task(void *lock, const T &func, const G &test);
 
 template <typename T>
 T ifloordiv(T a, T b) {
@@ -114,6 +128,13 @@ template <typename... Args>
 void taichi_printf(LLVMRuntime *runtime, const char *format, Args &&... args);
 
 extern "C" {
+
+i64 cuda_clock_i64() {
+  return 0;
+}
+
+void system_memfence() {
+}
 
 #if ARCH_cuda
 void cuda_vprintf(Ptr format, Ptr arg);
@@ -341,18 +362,19 @@ void taichi_assert_runtime(LLVMRuntime *runtime, i32 test, const char *msg);
 void ___stubs___() {
 #if ARCH_cuda
   cuda_vprintf(nullptr, nullptr);
+  cuda_clock_i64();
 #endif
 }
 }
 
-/*
-A simple list data structure
-Data are organized in chunks, where each chunk is a piece of virtual memory
-*/
-
 bool is_power_of_two(uint32 x) {
   return x != 0 && (x & (x - 1)) == 0;
 }
+
+/*
+A simple list data structure that is infinitely long.
+Data are organized in chunks, where each chunk is allocated on demand.
+*/
 
 struct ListManager {
   static constexpr std::size_t max_num_chunks = 1024;
@@ -406,13 +428,6 @@ struct ListManager {
   Ptr get_element_ptr(i32 i) {
     return chunks[i >> log2chunk_num_elements] +
            element_size * (i & ((1 << log2chunk_num_elements) - 1));
-
-    /*
-    auto c = chunks[i >> log2chunk_num_elements];
-    auto ret = c + element_size * (i & ((1 << log2chunk_num_elements) - 1));
-    Printf("allocating c %p ret %p i %d\n", c, ret, i);
-    return ret;
-     */
   }
 
   template <typename T>
@@ -431,18 +446,12 @@ struct ListManager {
 
   i32 ptr2index(Ptr ptr) {
     auto chunk_size = max_num_elements_per_chunk * element_size;
-    // int sum = 0;
     for (int i = 0; i < max_num_chunks; i++) {
-      /*
-      Printf("i %d sum %d Ptr %p chunk %p ptr-chunk %lld chunk_size %lld\n", i,
-             sum, ptr, chunks[i], ptr - chunks[i], chunk_size);
-             */
       taichi_assert_runtime(runtime, chunks[i] != nullptr, "ptr not found.");
       if (chunks[i] <= ptr && ptr < chunks[i] + chunk_size) {
         return (i << log2chunk_num_elements) +
                i32((ptr - chunks[i]) / element_size);
       }
-      // sum += (i + 1);
     }
     return -1;
   }
@@ -459,8 +468,6 @@ struct Element {
 STRUCT_FIELD(Element, element);
 STRUCT_FIELD(Element, pcoord);
 STRUCT_FIELD_ARRAY(Element, loop_bounds);
-
-constexpr int num_rand_states = 1024 * 32;
 
 struct RandState {
   u32 x;
@@ -511,16 +518,21 @@ struct LLVMRuntime {
   void (*profiler_start)(Ptr, Ptr);
   void (*profiler_stop)(Ptr);
 
-  char error_message_buffer[taichi_max_message_length];
+  char error_message_template[taichi_error_message_max_length];
+  uint64 error_message_arguments[taichi_error_message_max_num_arguments];
   i32 error_message_lock = 0;
   i64 error_code = 0;
 
   Ptr result_buffer;
   i32 allocator_lock;
 
+  i32 num_rand_states;
+
   template <typename T>
   void set_result(std::size_t i, T t) {
-    ((u64 *)result_buffer)[i] = taichi_union_cast<uint64>(t);
+    static_assert(sizeof(T) <= sizeof(uint64));
+    ((u64 *)result_buffer)[i] =
+        taichi_union_cast_with_different_sizes<uint64>(t);
   }
 
   template <typename T, typename... Args>
@@ -531,6 +543,7 @@ struct LLVMRuntime {
   }
 };
 
+// TODO: are these necessary?
 STRUCT_FIELD_ARRAY(LLVMRuntime, element_lists);
 STRUCT_FIELD_ARRAY(LLVMRuntime, node_allocators);
 STRUCT_FIELD(LLVMRuntime, root);
@@ -544,6 +557,7 @@ STRUCT_FIELD(LLVMRuntime, profiler_start);
 STRUCT_FIELD(LLVMRuntime, profiler_stop);
 
 // NodeManager of node S (hash, pointer) managers the memory allocation of S_ch
+// It makes use of three ListManagers.
 struct NodeManager {
   LLVMRuntime *runtime;
   i32 lock;
@@ -639,66 +653,58 @@ Ptr get_temporary_pointer(LLVMRuntime *runtime, u64 offset) {
   return runtime->temporaries + offset;
 }
 
-void runtime_retrieve_error_code(LLVMRuntime *runtime) {
+void runtime_retrieve_and_reset_error_code(LLVMRuntime *runtime) {
   runtime->set_result(taichi_result_buffer_error_id, runtime->error_code);
+  runtime->error_code = 0;
 }
 
-void runtime_retrieve_error_message(LLVMRuntime *runtime) {
+void runtime_retrieve_error_message(LLVMRuntime *runtime, int i) {
   runtime->set_result(taichi_result_buffer_error_id,
-                      runtime->error_message_buffer);
+                      runtime->error_message_template[i]);
 }
 
-#if ARCH_cuda
-void __assertfail(const char *message,
-                  const char *file,
-                  i32 line,
-                  const char *function,
-                  std::size_t charSize);
-
-void taichi_assert_runtime(LLVMRuntime *runtime, i32 test, const char *msg) {
-  if (enable_assert) {
-    if (test == 0) {
-      __assertfail(msg, "", 1, "", 1);
-    }
-  }
+void runtime_retrieve_error_message_argument(LLVMRuntime *runtime,
+                                             int argument_id) {
+  runtime->set_result(taichi_result_buffer_error_id,
+                      runtime->error_message_arguments[argument_id]);
 }
-#else
-void taichi_assert_runtime(LLVMRuntime *runtime, i32 test, const char *msg) {
-  if (!enable_assert || test != 0 || runtime->error_code)
-    return;
-  locked_task(&runtime->error_message_lock, [&] {
-    if (!runtime->error_code) {
-      runtime->error_code = 1;  // Assertion failure
-      memcpy(runtime->error_message_buffer, msg,
-             std::min(strlen(msg), taichi_max_message_length));
-    }
-  });
-}
-#endif
 
 void taichi_assert(Context *context, i32 test, const char *msg) {
   taichi_assert_runtime(context->runtime, test, msg);
 }
 
-const std::size_t ASSERT_MSG_BUFFER_SIZE = 2048;
-char assert_msg_buffer[ASSERT_MSG_BUFFER_SIZE];
-i32 assert_msg_buffer_lock = 0;
 void taichi_assert_format(LLVMRuntime *runtime,
                           i32 test,
                           const char *format,
-                          ...) {
-  if (!enable_assert || test != 0 || runtime->error_code)
+                          int num_arguments,
+                          uint64 *arguments) {
+  if (!enable_assert || test != 0)
     return;
-  std::va_list args;
-  va_start(args, format);
-  locked_task(&runtime->error_message_lock, [&] {
-    if (!runtime->error_code) {
-      runtime->error_code = 1;  // Assertion failure
-      runtime->host_vsnprintf(runtime->error_message_buffer,
-                              taichi_max_message_length, format, args);
-    }
-  });
-  va_end(args);
+  if (!runtime->error_code) {
+    locked_task(&runtime->error_message_lock, [&] {
+      if (!runtime->error_code) {
+        runtime->error_code = 1;  // Assertion failure
+
+        memset(runtime->error_message_template, 0,
+               taichi_error_message_max_length);
+        memcpy(runtime->error_message_template, format,
+               std::min(strlen(format), taichi_error_message_max_length - 1));
+        for (int i = 0; i < num_arguments; i++) {
+          runtime->error_message_arguments[i] = arguments[i];
+        }
+      }
+    });
+  }
+#if ARCH_cuda
+  // Kill this CUDA thread.
+  asm("exit;");
+#else
+  // TODO: kill this CPU thread here.
+#endif
+}
+
+void taichi_assert_runtime(LLVMRuntime *runtime, i32 test, const char *msg) {
+  taichi_assert_format(runtime, test, msg, 0, nullptr);
 }
 
 Ptr LLVMRuntime::allocate_aligned(std::size_t size, std::size_t alignment) {
@@ -710,15 +716,30 @@ Ptr LLVMRuntime::allocate_aligned(std::size_t size, std::size_t alignment) {
 
 Ptr LLVMRuntime::allocate_from_buffer(std::size_t size, std::size_t alignment) {
   Ptr ret;
+  bool success = false;
   locked_task(&allocator_lock, [&] {
-    preallocated_head +=
+    auto alignment_bytes =
         alignment - 1 -
         ((std::size_t)preallocated_head + alignment - 1) % alignment;
-    ret = preallocated_head;
-    preallocated_head += size;
-    taichi_assert_runtime(this, preallocated_head <= preallocated_tail,
-                          "Out of pre-allocated memory");
+    size += alignment_bytes;
+    if (preallocated_head + size <= preallocated_tail) {
+      ret = preallocated_head;
+      preallocated_head += size;
+      success = true;
+    } else {
+      success = false;
+    }
   });
+  if (!success) {
+#if ARCH_cuda
+    // Here unfortunately we have to rely on a native CUDA assert failure to
+    // halt the whole grid. Using a taichi_assert_runtime will not finish the
+    // whole kernel execution immediately.
+    __assertfail("Out of CUDA pre-allocated memory", "Taichi JIT", 0,
+                 "allocate_from_buffer", 1);
+#endif
+  }
+  taichi_assert_runtime(this, success, "Out of pre-allocated memory");
   return ret;
 }
 
@@ -737,9 +758,13 @@ Ptr LLVMRuntime::request_allocate_aligned(std::size_t size,
     auto volatile r = &mem_req_queue->requests[i];
     atomic_exchange_u64((uint64 *)&r->size, size);
     atomic_exchange_u64((uint64 *)&r->alignment, alignment);
+
     // wait for host to allocate
-    while (r->ptr == nullptr)
-      ;
+    while (r->ptr == nullptr) {
+#if defined(ARCH_cuda)
+      system_memfence();
+#endif
+    };
     return r->ptr;
   }
 }
@@ -756,6 +781,7 @@ void runtime_initialize(
     std::size_t
         preallocated_size,  // Non-zero means use the preallocated buffer
     Ptr preallocated_buffer,
+    i32 num_rand_states,
     void *_vm_allocator,
     void *_host_printf,
     void *_host_vsnprintf) {
@@ -801,9 +827,10 @@ void runtime_initialize(
   runtime->temporaries = (Ptr)runtime->allocate_aligned(
       taichi_global_tmp_buffer_size, taichi_page_size);
 
+  runtime->num_rand_states = num_rand_states;
   runtime->rand_states = (RandState *)runtime->allocate_aligned(
-      sizeof(RandState) * num_rand_states, taichi_page_size);
-  for (int i = 0; i < num_rand_states; i++)
+      sizeof(RandState) * runtime->num_rand_states, taichi_page_size);
+  for (int i = 0; i < runtime->num_rand_states; i++)
     initialize_rand_state(&runtime->rand_states[i], i);
 }
 
@@ -812,6 +839,7 @@ void runtime_initialize2(LLVMRuntime *runtime, int root_id, int num_snodes) {
 
   // initialize the root node element list
   for (int i = 0; i < num_snodes; i++) {
+    // TODO: some SNodes do not actually need an element list.
     runtime->element_lists[i] =
         runtime->create<ListManager>(runtime, sizeof(Element), 1024 * 64);
   }
@@ -840,9 +868,13 @@ void runtime_NodeAllocator_initialize(LLVMRuntime *runtime,
       runtime->create<NodeManager>(runtime, node_size, 1024 * 16);
 }
 
-void runtime_allocate_ambient(LLVMRuntime *runtime, int snode_id) {
+void runtime_allocate_ambient(LLVMRuntime *runtime,
+                              int snode_id,
+                              std::size_t size) {
+  // Do not use NodeManager for the ambient node since it will never be garbage
+  // collected.
   runtime->ambient_elements[snode_id] =
-      runtime->node_allocators[snode_id]->allocate();
+      runtime->request_allocate_aligned(size, 128);
 }
 
 void mutex_lock_i32(Ptr mutex) {
@@ -874,27 +906,76 @@ int32 block_dim() {
   return 0;
 }
 
-int32 grid_dim() {
+int32 ctlz_i32(i32 val) {
   return 0;
 }
 
-void sync_warp(uint32 mask) {
+int32 cttz_i32(i32 val) {
+  return 0;
+}
+
+int32 cuda_compute_capability() {
+  return 0;
+}
+
+int32 cuda_ballot(bool bit) {
+  return 0;
+}
+
+i32 cuda_shfl_down_sync_i32(u32 mask, i32 delta, i32 val, int width) {
+  return 0;
+}
+
+i32 cuda_shfl_down_i32(i32 delta, i32 val, int width) {
+  return 0;
+}
+
+int32 cuda_ballot_sync(int32 mask, bool bit) {
+  return 0;
+}
+
+i32 cuda_match_any_sync_i32(i32 mask, i32 value) {
+  return 0;
+}
+
+i32 cuda_match_any_sync_i64(i32 mask, i64 value) {
+#if ARCH_cuda
+  u32 ret;
+  asm volatile("match.any.sync.b64  %0, %1, %2;"
+               : "=r"(ret)
+               : "l"(value), "r"(mask));
+  return ret;
+#else
+  return 0;
+#endif
+}
+
+#if ARCH_cuda
+uint32 cuda_active_mask() {
+  unsigned int mask;
+  asm volatile("activemask.b32 %0;" : "=r"(mask));
+  return mask;
+}
+#else
+uint32 cuda_active_mask() {
+  return 0;
+}
+#endif
+
+int32 grid_dim() {
+  return 0;
 }
 
 void block_barrier() {
 }
 
-int32 warp_active_mask() {
-  return 0;
+void warp_barrier(uint32 mask) {
 }
 
 void block_memfence() {
 }
 
 void grid_memfence() {
-}
-
-void system_memfence() {
 }
 
 // "Element", "component" are different concepts
@@ -908,9 +989,63 @@ void clear_list(LLVMRuntime *runtime, StructMeta *parent, StructMeta *child) {
  * The element list of a SNode, maintains pointers to its instances, and
  * instances' parents' coordinates
  */
-void element_listgen(LLVMRuntime *runtime,
-                     StructMeta *parent,
-                     StructMeta *child) {
+
+// For the root node there is only one container,
+// therefore we use a special kernel for more parallelism.
+void element_listgen_root(LLVMRuntime *runtime,
+                          StructMeta *parent,
+                          StructMeta *child) {
+  // If there's just one element in the parent list, we need to use the blocks
+  // (instead of threads) to split the parent container
+  auto parent_list = runtime->element_lists[parent->snode_id];
+  auto child_list = runtime->element_lists[child->snode_id];
+  // Cache the func pointers here for better compiler optimization
+  auto parent_refine_coordinates = parent->refine_coordinates;
+  auto parent_lookup_element = parent->lookup_element;
+  auto child_get_num_elements = child->get_num_elements;
+  auto child_from_parent_element = child->from_parent_element;
+#if ARCH_cuda
+  // All blocks share the only root container, which has only one child
+  // container.
+  // Each thread processes a subset of the child container for more parallelism.
+  int c_start = block_dim() * block_idx() + thread_idx();
+  int c_step = grid_dim() * block_dim();
+#else
+  int c_start = 0;
+  int c_step = 1;
+#endif
+  // Note that the root node has only one container, and the `element`
+  // representing that single container has only one 'child':
+  // element.loop_bounds[0] = 0 and element.loop_bounds[1] = 1
+  // Therefore, compared with element_listgen_nonroot,
+  // we need neither `i` to loop over the `elements`, nor `j` to
+  // loop over the children.
+
+  auto element = parent_list->get<Element>(0);
+
+  PhysicalCoordinates refined_coord;
+  parent_refine_coordinates(&element.pcoord, &refined_coord, 0);
+
+  auto ch_element = parent_lookup_element((Ptr)parent, element.element, 0);
+  ch_element = child_from_parent_element((Ptr)ch_element);
+  auto ch_num_elements = child_get_num_elements((Ptr)child, ch_element);
+  auto ch_element_size =
+      std::min(ch_num_elements, taichi_listgen_max_element_size);
+
+  // Here is a grid-stride loop.
+  for (int c = c_start; c * ch_element_size < ch_num_elements; c += c_step) {
+    Element elem;
+    elem.element = ch_element;
+    elem.loop_bounds[0] = c * ch_element_size;
+    elem.loop_bounds[1] = std::min((c + 1) * ch_element_size, ch_num_elements);
+    elem.pcoord = refined_coord;
+    child_list->append(&elem);
+  }
+}
+
+void element_listgen_nonroot(LLVMRuntime *runtime,
+                             StructMeta *parent,
+                             StructMeta *child) {
   auto parent_list = runtime->element_lists[parent->snode_id];
   int num_parent_elements = parent_list->size();
   auto child_list = runtime->element_lists[child->snode_id];
@@ -920,10 +1055,11 @@ void element_listgen(LLVMRuntime *runtime,
   auto parent_lookup_element = parent->lookup_element;
   auto child_get_num_elements = child->get_num_elements;
   auto child_from_parent_element = child->from_parent_element;
-  int max_range = 1024;
 #if ARCH_cuda
+  // Each block processes a slice of a parent container
   int i_start = block_idx();
   int i_step = grid_dim();
+  // Each thread processes an element of the parent container
   int j_start = thread_idx();
   int j_step = block_dim();
 #else
@@ -932,13 +1068,10 @@ void element_listgen(LLVMRuntime *runtime,
   int j_start = 0;
   int j_step = 1;
 #endif
-  int parent_split = std::max(parent->max_num_elements / max_range, 1);
-  int range = (parent->max_num_elements + parent_split - 1) / parent_split;
-  for (int i = i_start; i < num_parent_elements * parent_split; i += i_step) {
-    auto element = parent_list->get<Element>(i / parent_split);
-    int split_id = i % parent_split;
-    int j_lower = element.loop_bounds[0] + split_id * range + j_start;
-    int j_higher = std::min(element.loop_bounds[1], j_lower + range);
+  for (int i = i_start; i < num_parent_elements; i += i_step) {
+    auto element = parent_list->get<Element>(i);
+    int j_lower = element.loop_bounds[0] + j_start;
+    int j_higher = element.loop_bounds[1];
     for (int j = j_lower; j < j_higher; j += j_step) {
       PhysicalCoordinates refined_coord;
       parent_refine_coordinates(&element.pcoord, &refined_coord, j);
@@ -946,12 +1079,19 @@ void element_listgen(LLVMRuntime *runtime,
         auto ch_element =
             parent_lookup_element((Ptr)parent, element.element, j);
         ch_element = child_from_parent_element((Ptr)ch_element);
-        Element elem;
-        elem.element = ch_element;
-        elem.loop_bounds[0] = 0;
-        elem.loop_bounds[1] = child_get_num_elements((Ptr)child, ch_element);
-        elem.pcoord = refined_coord;
-        child_list->append(&elem);
+        auto ch_num_elements = child_get_num_elements((Ptr)child, ch_element);
+        auto ch_element_size =
+            std::min(ch_num_elements, taichi_listgen_max_element_size);
+        for (int ch_lower = 0; ch_lower < ch_num_elements;
+             ch_lower += ch_element_size) {
+          Element elem;
+          elem.element = ch_element;
+          elem.loop_bounds[0] = ch_lower;
+          elem.loop_bounds[1] =
+              std::min(ch_lower + ch_element_size, ch_num_elements);
+          elem.pcoord = refined_coord;
+          child_list->append(&elem);
+        }
       }
     }
   }
@@ -959,7 +1099,7 @@ void element_listgen(LLVMRuntime *runtime,
 
 using BlockTask = void(Context *, Element *, int, int);
 
-struct block_task_helper_context {
+struct cpu_block_task_helper_context {
   Context *context;
   BlockTask *task;
   ListManager *list;
@@ -967,12 +1107,18 @@ struct block_task_helper_context {
   int element_split;
 };
 
+// TODO: To enforce inlining, we need to create in LLVM a new function that
+// calls block_helper and the BLS xlogues, and pass that function to the
+// scheduler.
+
+// TODO: TLS should be directly passed to the scheduler, so that it lives
+// with the threads (instead of blocks).
+
 void block_helper(void *ctx_, int i) {
-  auto ctx = (block_task_helper_context *)(ctx_);
+  auto ctx = (cpu_block_task_helper_context *)(ctx_);
   int element_id = i / ctx->element_split;
   int part_size = ctx->element_size / ctx->element_split;
   int part_id = i % ctx->element_split;
-  // printf("%d %d %d\n", element_id, part_size, part_id);
   auto &e = ctx->list->get<Element>(element_id);
   int lower = e.loop_bounds[0] + part_id * part_size;
   int upper = e.loop_bounds[0] + (part_id + 1) * part_size;
@@ -983,16 +1129,18 @@ void block_helper(void *ctx_, int i) {
   }
 }
 
-void for_each_block(Context *context,
-                    int snode_id,
-                    int element_size,
-                    int element_split,
-                    BlockTask *task,
-                    int num_threads) {
+void parallel_struct_for(Context *context,
+                         int snode_id,
+                         int element_size,
+                         int element_split,
+                         BlockTask *task,
+                         int num_threads) {
   auto list = (context->runtime)->element_lists[snode_id];
   auto list_tail = list->size();
 #if ARCH_cuda
   int i = block_idx();
+  // TODO: refactor element_split more systematically.
+  element_split = 1;
   const auto part_size = element_size / element_split;
   while (true) {
     int element_id = i / element_split;
@@ -1008,7 +1156,7 @@ void for_each_block(Context *context,
     i += grid_dim();
   }
 #else
-  block_task_helper_context ctx;
+  cpu_block_task_helper_context ctx;
   ctx.context = context;
   ctx.task = task;
   ctx.list = list;
@@ -1022,30 +1170,41 @@ void for_each_block(Context *context,
 #endif
 }
 
+using range_for_xlogue = void (*)(Context *, /*TLS*/ char *tls_base);
+
 struct range_task_helper_context {
   Context *context;
-  RangeForTaskFunc *task;
+  range_for_xlogue prologue{nullptr};
+  RangeForTaskFunc *body{nullptr};
+  range_for_xlogue epilogue{nullptr};
+  std::size_t tls_size{1};
   int begin;
   int end;
   int block_size;
   int step;
 };
 
-void parallel_range_for_task(void *range_context, int task_id) {
+void cpu_parallel_range_for_task(void *range_context, int task_id) {
   auto ctx = *(range_task_helper_context *)range_context;
+  alignas(8) char tls_buffer[ctx.tls_size];
+  auto tls_ptr = &tls_buffer[0];
+  if (ctx.prologue)
+    ctx.prologue(ctx.context, tls_ptr);
   if (ctx.step == 1) {
     int block_start = ctx.begin + task_id * ctx.block_size;
     int block_end = std::min(block_start + ctx.block_size, ctx.end);
     for (int i = block_start; i < block_end; i++) {
-      ctx.task(ctx.context, i);
+      ctx.body(ctx.context, tls_ptr, i);
     }
   } else if (ctx.step == -1) {
     int block_start = ctx.end - task_id * ctx.block_size;
     int block_end = std::max(ctx.begin, block_start * ctx.block_size);
     for (int i = block_start - 1; i >= block_end; i--) {
-      ctx.task(ctx.context, i);
+      ctx.body(ctx.context, tls_ptr, i);
     }
   }
+  if (ctx.epilogue)
+    ctx.epilogue(ctx.context, tls_ptr);
 }
 
 void cpu_parallel_range_for(Context *context,
@@ -1054,10 +1213,16 @@ void cpu_parallel_range_for(Context *context,
                             int end,
                             int step,
                             int block_dim,
-                            RangeForTaskFunc *task) {
+                            range_for_xlogue prologue,
+                            RangeForTaskFunc *body,
+                            range_for_xlogue epilogue,
+                            std::size_t tls_size) {
   range_task_helper_context ctx;
   ctx.context = context;
-  ctx.task = task;
+  ctx.prologue = prologue;
+  ctx.tls_size = tls_size;
+  ctx.body = body;
+  ctx.epilogue = epilogue;
   ctx.begin = begin;
   ctx.end = end;
   ctx.step = step;
@@ -1068,7 +1233,7 @@ void cpu_parallel_range_for(Context *context,
   if (block_dim == 0) {
     // adaptive block dim
     auto num_items = (ctx.end - ctx.begin) / std::abs(step);
-    // ensure each thread have at least ~32 tasks for load balancing
+    // ensure each thread has at least ~32 tasks for load balancing
     // and each task has at least 512 items to amortize scheduler overhead
     block_dim = std::min(512, std::max(1, num_items / (num_threads * 32)));
   }
@@ -1076,18 +1241,27 @@ void cpu_parallel_range_for(Context *context,
   auto runtime = context->runtime;
   runtime->parallel_for(runtime->thread_pool,
                         (end - begin + block_dim - 1) / block_dim, num_threads,
-                        &ctx, parallel_range_for_task);
+                        &ctx, cpu_parallel_range_for_task);
 }
 
 void gpu_parallel_range_for(Context *context,
                             int begin,
                             int end,
-                            RangeForTaskFunc *func) {
+                            range_for_xlogue prologue,
+                            RangeForTaskFunc *func,
+                            range_for_xlogue epilogue,
+                            const std::size_t tls_size) {
   int idx = thread_idx() + block_dim() * block_idx() + begin;
+  alignas(8) char tls_buffer[tls_size];
+  auto tls_ptr = &tls_buffer[0];
+  if (prologue)
+    prologue(context, tls_ptr);
   while (idx < end) {
-    func(context, idx);
+    func(context, tls_ptr, idx);
     idx += block_dim() * grid_dim();
   }
+  if (epilogue)
+    epilogue(context, tls_ptr);
 }
 
 i32 linear_thread_idx() {
@@ -1102,11 +1276,9 @@ i32 linear_thread_idx() {
 
 void ListManager::touch_chunk(int chunk_id) {
   if (!chunks[chunk_id]) {
-    // Printf("chunkid %d\n", chunk_id);
     locked_task(&lock, [&] {
       // may have been allocated during lock contention
       if (!chunks[chunk_id]) {
-        // Printf("Allocating chunk %d\n", chunk_id);
         grid_memfence();
         auto chunk_ptr = runtime->request_allocate_aligned(
             max_num_elements_per_chunk * element_size, 4096);
@@ -1137,6 +1309,7 @@ void gc_parallel_0(LLVMRuntime *runtime, int snode_id) {
   auto free_list_used = allocator->free_list_used;
   using T = NodeManager::list_data_type;
 
+  // Move unused elements to the beginning of the free_list
   int i = linear_thread_idx();
   if (free_list_used * 2 > free_list_size) {
     // Directly copy. Dst and src does not overlap
@@ -1159,7 +1332,11 @@ void gc_parallel_0(LLVMRuntime *runtime, int snode_id) {
 void gc_parallel_1(LLVMRuntime *runtime, int snode_id) {
   auto allocator = runtime->node_allocators[snode_id];
   auto free_list = allocator->free_list;
-  free_list->clear();
+
+  const i32 num_unused =
+      max_i32(free_list->size() - allocator->free_list_used, 0);
+  free_list->resize(num_unused);
+
   allocator->free_list_used = 0;
   allocator->recycle_list_size_backup = allocator->recycled_list->size();
   allocator->recycled_list->clear();
@@ -1211,28 +1388,22 @@ void gc_parallel_2(LLVMRuntime *runtime, int snode_id) {
 extern "C" {
 
 u32 cuda_rand_u32(Context *context) {
-  auto state = &((LLVMRuntime *)context->runtime)
-                    ->rand_states[linear_thread_idx() % num_rand_states];
-  u32 ret;
-  auto lock = (Ptr)&state->lock;
+  auto state =
+      &((LLVMRuntime *)context->runtime)->rand_states[linear_thread_idx()];
 
-  bool done = false;
-  // TODO: locking here is very slow...
-  locked_task(lock, [&] {
-    auto &x = state->x;
-    auto &y = state->y;
-    auto &z = state->z;
-    auto &w = state->w;
-    auto t = x ^ (x << 11);
-    x = y;
-    y = z;
-    z = w;
-    w = (w ^ (w >> 19)) ^ (t ^ (t >> 8));
-    ret = w;
-    done = true;
-  });
-  return ret * 1000000007;  // multiply a prime number here is very necessary -
-                            // it decorrelates streams of PRNGs
+  auto &x = state->x;
+  auto &y = state->y;
+  auto &z = state->z;
+  auto &w = state->w;
+  auto t = x ^ (x << 11);
+
+  x = y;
+  y = z;
+  z = w;
+  w = (w ^ (w >> 19)) ^ (t ^ (t >> 8));
+
+  return w * 1000000007;  // multiply a prime number here is very necessary -
+                          // it decorrelates streams of PRNGs
 }
 
 uint64 cuda_rand_u64(Context *context) {
@@ -1255,7 +1426,6 @@ i64 cuda_rand_i64(Context *context) {
   return cuda_rand_u64(context);
 }
 };
-
 #endif
 
 struct printf_helper {

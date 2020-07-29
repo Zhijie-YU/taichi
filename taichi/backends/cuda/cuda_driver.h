@@ -22,12 +22,15 @@ TLANG_NAMESPACE_BEGIN
 // Driver constants from cuda.h
 
 constexpr uint32 CU_EVENT_DEFAULT = 0x0;
+constexpr uint32 CU_STREAM_DEFAULT = 0x0;
+constexpr uint32 CU_STREAM_NON_BLOCKING = 0x1;
 constexpr uint32 CU_MEM_ATTACH_GLOBAL = 0x1;
 constexpr uint32 CU_MEM_ADVISE_SET_PREFERRED_LOCATION = 3;
 constexpr uint32 CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X = 2;
 constexpr uint32 CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16;
 constexpr uint32 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
 constexpr uint32 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
+constexpr uint32 CUDA_ERROR_ASSERT = 710;
 
 std::string get_cuda_error_message(uint32 err);
 

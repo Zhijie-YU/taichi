@@ -53,8 +53,8 @@ def substep():
     if material[p] == 0:  # Reset deformation gradient to avoid numerical instability
       F[p] = ti.Matrix.identity(ti.f32, 2) * ti.sqrt(J)
     elif material[p] == 2:
-      F[p] = U @ sig @ V.T() # Reconstruct elastic deformation gradient after plasticity
-    stress = 2 * mu * (F[p] - U @ V.T()) @ F[p].T() + ti.Matrix.identity(ti.f32, 2) * la * J * (J - 1)
+      F[p] = U @ sig @ V.transpose() # Reconstruct elastic deformation gradient after plasticity
+    stress = 2 * mu * (F[p] - U @ V.transpose()) @ F[p].transpose() + ti.Matrix.identity(ti.f32, 2) * la * J * (J - 1)
     stress = (-dt * p_vol * 4 * inv_dx * inv_dx) * stress
     affine = stress + p_mass * C[p]
     for i, j in ti.static(ti.ndrange(3, 3)): # Loop over 3x3 grid node neighborhood
@@ -105,9 +105,9 @@ reset()
 gravity[None] = [0, -1]
 
 for frame in range(20000):
-  while gui.get_event(ti.GUI.PRESS):
+  if gui.get_event(ti.GUI.PRESS):
     if gui.event.key == 'r': reset()
-    elif gui.event.key in [ti.GUI.ESCAPE, ti.GUI.EXIT]: exit(0)
+    elif gui.event.key in [ti.GUI.ESCAPE, ti.GUI.EXIT]: break
   if gui.event is not None: gravity[None] = [0, 0] # if had any event
   if gui.is_pressed(ti.GUI.LEFT,  'a'): gravity[None][0] = -1
   if gui.is_pressed(ti.GUI.RIGHT, 'd'): gravity[None][0] = 1

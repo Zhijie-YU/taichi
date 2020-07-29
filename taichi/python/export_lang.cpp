@@ -11,6 +11,11 @@
 #include "taichi/gui/gui.h"
 #include "taichi/math/svd.h"
 #include "taichi/util/statistics.h"
+#include "taichi/util/action_recorder.h"
+
+#if defined(TI_WITH_CUDA)
+#include "taichi/backends/cuda/cuda_context.h"
+#endif
 
 TI_NAMESPACE_BEGIN
 
@@ -75,6 +80,7 @@ void export_lang(py::module &m) {
       .def_readwrite("debug", &CompileConfig::debug)
       .def_readwrite("check_out_of_bound", &CompileConfig::check_out_of_bound)
       .def_readwrite("print_accessor_ir", &CompileConfig::print_accessor_ir)
+      .def_readwrite("print_evaluator_ir", &CompileConfig::print_evaluator_ir)
       .def_readwrite("use_llvm", &CompileConfig::use_llvm)
       .def_readwrite("print_benchmark_stat",
                      &CompileConfig::print_benchmark_stat)
@@ -94,20 +100,27 @@ void export_lang(py::module &m) {
                      &CompileConfig::default_cpu_block_dim)
       .def_readwrite("default_gpu_block_dim",
                      &CompileConfig::default_gpu_block_dim)
+      .def_readwrite("saturating_grid_dim", &CompileConfig::saturating_grid_dim)
+      .def_readwrite("max_block_dim", &CompileConfig::max_block_dim)
       .def_readwrite("verbose_kernel_launches",
                      &CompileConfig::verbose_kernel_launches)
       .def_readwrite("verbose", &CompileConfig::verbose)
       .def_readwrite("demote_dense_struct_fors",
                      &CompileConfig::demote_dense_struct_fors)
       .def_readwrite("use_unified_memory", &CompileConfig::use_unified_memory)
-      .def_readwrite("enable_profiler", &CompileConfig::enable_profiler)
+      .def_readwrite("kernel_profiler", &CompileConfig::kernel_profiler)
       .def_readwrite("default_fp", &CompileConfig::default_fp)
       .def_readwrite("default_ip", &CompileConfig::default_ip)
       .def_readwrite("device_memory_GB", &CompileConfig::device_memory_GB)
       .def_readwrite("device_memory_fraction",
                      &CompileConfig::device_memory_fraction)
       .def_readwrite("fast_math", &CompileConfig::fast_math)
-      .def_readwrite("async", &CompileConfig::async);
+      .def_readwrite("advanced_optimization",
+                     &CompileConfig::advanced_optimization)
+      .def_readwrite("ad_stack_size", &CompileConfig::ad_stack_size)
+      .def_readwrite("async_mode", &CompileConfig::async_mode)
+      .def_readwrite("flatten_if", &CompileConfig::flatten_if)
+      .def_readwrite("make_thread_local", &CompileConfig::make_thread_local);
 
   m.def("reset_default_compile_config",
         [&]() { default_compile_config = CompileConfig(); });
@@ -119,17 +132,8 @@ void export_lang(py::module &m) {
   py::class_<Program>(m, "Program")
       .def(py::init<>())
       .def_readonly("config", &Program::config)
-      .def("profiler_print", &Program::profiler_print)
-      .def("profiler_clear", &Program::profiler_clear)
-      .def("profiler_start", &Program::profiler_start)
-      .def("profiler_stop", &Program::profiler_stop)
-      .def("get_profiler",
-           [](Program *program) -> void * {
-             // We didn't expose the ProfilerBase interface, so the only purpose
-             // of this method is to expose the address of the profiler, so that
-             // other modules (e.g. GUI) can receive the profiler.
-             return (void *)(program->get_profiler());
-           })
+      .def("kernel_profiler_print", &Program::kernel_profiler_print)
+      .def("kernel_profiler_clear", &Program::kernel_profiler_clear)
       .def("finalize", &Program::finalize)
       .def("get_root",
            [&](Program *program) -> SNode * {
@@ -188,7 +192,13 @@ void export_lang(py::module &m) {
       .def("get_expr", &SNode::get_expr, py::return_value_policy::reference)
       .def("write_int", &SNode::write_int)
       .def("write_float", &SNode::write_float)
-      .def("get_num_elements_along_axis", &SNode::num_elements_along_axis)
+      .def("get_shape_along_axis", &SNode::shape_along_axis)
+      .def("get_physical_index_position",
+           [](SNode *snode) {
+             return std::vector<int>(
+                 snode->physical_index_position,
+                 snode->physical_index_position + taichi_max_num_indices);
+           })
       .def("num_active_indices",
            [](SNode *snode) { return snode->num_active_indices; });
 
@@ -239,9 +249,22 @@ void export_lang(py::module &m) {
     return Deactivate(snode, indices);
   });
 
+  m.def("insert_activate", [](SNode *snode, const ExprGroup &indices) {
+    return Activate(snode, indices);
+  });
+
   m.def("insert_append",
         [](SNode *snode, const ExprGroup &indices, const Expr &val) {
           return Append(snode, indices, val);
+        });
+
+  m.def("insert_external_func_call",
+        [](std::size_t func_addr, std::string source, const ExprGroup &args,
+           const ExprGroup &outputs) {
+          auto expr = Expr::make<ExternalFuncCallExpression>(
+              (void *)func_addr, source, args.exprs, outputs.exprs);
+
+          current_ast_builder().insert(Stmt::make<FrontendEvalStmt>(expr));
         });
 
   m.def("insert_is_active", [](SNode *snode, const ExprGroup &indices) {
@@ -399,6 +422,10 @@ void export_lang(py::module &m) {
 
   m.def("expr_index", expr_index);
 
+  m.def("expr_assume_in_range", AssumeInRange);
+
+  m.def("expr_select", expr_select);
+
 #define DEFINE_EXPRESSION_OP_UNARY(x) m.def("expr_" #x, expr_##x);
 
   m.def("expr_neg", [&](const Expr &e) { return -e; });
@@ -518,6 +545,9 @@ void export_lang(py::module &m) {
   m.def("vectorize", Vectorize);
   m.def("block_dim", BlockDim);
   m.def("cache", Cache);
+  m.def("no_activate", [](SNode *snode) {
+    get_current_program().get_current_kernel().no_activate.push_back(snode);
+  });
   m.def("stop_grad",
         [](SNode *snode) { current_ast_builder().stop_gradient(snode); });
 
@@ -538,8 +568,9 @@ void export_lang(py::module &m) {
   m.def("get_version_major", get_version_major);
   m.def("get_version_minor", get_version_minor);
   m.def("get_version_patch", get_version_patch);
+  m.def("get_llvm_version_string", get_llvm_version_string);
   m.def("test_printf", [] { printf("test_printf\n"); });
-  m.def("test_logging", [] { TI_INFO("test_logging\n"); });
+  m.def("test_logging", [] { TI_INFO("test_logging"); });
   m.def("trigger_crash", [] { *(int *)(1) = 0; });
   m.def("get_max_num_indices", [] { return taichi_max_num_indices; });
   m.def("get_max_num_args", [] { return taichi_max_num_args; });
@@ -549,13 +580,41 @@ void export_lang(py::module &m) {
   m.def("global_var_expr_from_snode", [](SNode *snode) {
     return Expr::make<GlobalVariableExpression>(snode);
   });
-  m.def("is_supported", is_supported);
+  m.def("is_extension_supported", is_extension_supported);
 
   m.def("print_stat", [] { stat.print(); });
 
+  m.def("record_action_hint", [](std::string content) {
+    ActionRecorder::get_instance().record("hint",
+                                          {ActionArg("content", content)});
+  });
+
+  m.def("start_recording", [](const std::string &fn) {
+    ActionRecorder::get_instance().start_recording(fn);
+  });
+
+  m.def("stop_recording",
+        []() { ActionRecorder::get_instance().stop_recording(); });
+
   // A temporary option which will be removed soon in the future
-  m.def("toggle_advanced_optimization",
-        [](bool option) { advanced_optimization = option; });
+  m.def("toggle_advanced_optimization", [](bool option) {
+    TI_WARN(
+        "'ti.core.toggle_advance_optimization(False)' is deprecated."
+        " Use 'ti.init(advanced_optimization=False)' instead");
+    get_current_program().config.advanced_optimization = option;
+  });
+
+  m.def("query_int64", [](const std::string &key) {
+    if (key == "cuda_compute_capability") {
+#if defined(TI_WITH_CUDA)
+      return CUDAContext::get_instance().get_compute_capability();
+#else
+      TI_NOT_IMPLEMENTED
+#endif
+    } else {
+      TI_ERROR("Key {} not supported in query_int64", key);
+    }
+  });
 }
 
 TI_NAMESPACE_END

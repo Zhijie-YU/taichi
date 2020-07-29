@@ -1,6 +1,8 @@
 *.swp
 *.swo
 /.vs
+/.*_localrc
+/tags
 /Debug
 *.sdf
 /x64
@@ -55,6 +57,7 @@ __pycache__
 *.ini
 *.egg-info
 .tlang_cache
+.tidle_*
 /taichi/common/version.h
 /taichi/common/commit_hash.h
 /python/test_env
@@ -70,3 +73,5 @@ _build
 *.mp4
 *.dat
 *.ptx
+*.ll
+*.bc

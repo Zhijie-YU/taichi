@@ -39,7 +39,7 @@ STR(
       int32_t root_mem_offset = 0;
     };
 
-    // ListManagerData manages the activeness of its associated SNode.
+    // ListManagerData manages a list of elements with adjustable size.
     struct ListManagerData {
       int32_t element_stride = 0;
 
@@ -49,11 +49,6 @@ STR(
       atomic_int next;
 
       atomic_int chunks[kTaichiNumChunks];
-    };
-
-    struct ListManager {
-      device ListManagerData *lm_data;
-      device MemoryAllocator *mem_alloc;
     };
 
     // This class is very similar to metal::SNodeDescriptor

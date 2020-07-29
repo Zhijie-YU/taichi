@@ -2,15 +2,16 @@
 
 #include "program.h"
 
-#include "taichi/common/task.h"
+#include "taichi/program/extension.h"
 #include "taichi/backends/metal/api.h"
 #include "taichi/backends/opengl/opengl_api.h"
 #if defined(TI_WITH_CUDA)
 #include "taichi/backends/cuda/cuda_driver.h"
 #include "taichi/backends/cuda/codegen_cuda.h"
-#include "taichi/backends/cuda/cuda_driver.h"
+#include "taichi/backends/cuda/cuda_context.h"
 #endif
 #include "taichi/backends/metal/codegen_metal.h"
+#include "taichi/backends/metal/env_config.h"
 #include "taichi/backends/opengl/codegen_opengl.h"
 #include "taichi/backends/cpu/codegen_cpu.h"
 #include "taichi/struct/struct.h"
@@ -22,6 +23,13 @@
 #include "taichi/ir/frontend_ir.h"
 #include "taichi/program/async_engine.h"
 #include "taichi/util/statistics.h"
+#if defined(TI_WITH_CC)
+#include "taichi/backends/cc/struct_cc.h"
+#include "taichi/backends/cc/cc_layout.h"
+#include "taichi/backends/cc/codegen_cc.h"
+#include "taichi/backends/cc/cc_configuation.h"
+#else
+#endif
 
 TI_NAMESPACE_BEGIN
 
@@ -30,6 +38,14 @@ bool is_cuda_api_available();
 TI_NAMESPACE_END
 
 TLANG_NAMESPACE_BEGIN
+
+#ifndef TI_WITH_CC
+namespace cccp {
+bool is_c_backend_available() {
+  return false;
+}
+}  // namespace cccp
+#endif
 
 void assert_failed_host(const char *msg) {
   TI_ERROR("Assertion failure: {}", msg);
@@ -78,6 +94,15 @@ Program::Program(Arch desired_arch) {
     }
   }
 
+  if (arch == Arch::cc) {
+#ifdef TI_WITH_CC
+    cc_program = std::make_unique<cccp::CCProgram>();
+#else
+    TI_WARN("No C backend detected.");
+    arch = host_arch();
+#endif
+  }
+
   if (arch != desired_arch) {
     TI_WARN("Falling back to {}", arch_name(arch));
   }
@@ -98,9 +123,18 @@ Program::Program(Arch desired_arch) {
 
   preallocated_device_buffer = nullptr;
 
-  if (config.enable_profiler && runtime) {
+  if (config.kernel_profiler && runtime) {
     runtime->set_profiler(profiler.get());
   }
+#if defined(TI_WITH_CUDA)
+  if (config.arch == Arch::cuda) {
+    if (config.kernel_profiler) {
+      CUDAContext::get_instance().set_profiler(profiler.get());
+    } else {
+      CUDAContext::get_instance().set_profiler(nullptr);
+    }
+  }
+#endif
 
   result_buffer = nullptr;
   current_kernel = nullptr;
@@ -108,8 +142,9 @@ Program::Program(Arch desired_arch) {
   llvm_runtime = nullptr;
   finalized = false;
   snode_root = std::make_unique<SNode>(0, SNodeType::root);
+  snode_root->is_path_all_dense = true;
 
-  if (config.async) {
+  if (config.async_mode) {
     TI_WARN("Running in async mode. This is experimental.");
     TI_ASSERT(arch_is_cpu(config.arch));
     async_engine = std::make_unique<AsyncEngine>();
@@ -119,13 +154,36 @@ Program::Program(Arch desired_arch) {
   if (config.debug)
     config.check_out_of_bound = true;
 
-  if (!arch_is_cpu(config.arch)) {
+  if (!is_extension_supported(config.arch, Extension::assertion)) {
     if (config.check_out_of_bound) {
-      TI_WARN(
-          "Out-of-bound access checking is only implemented on CPUs backends "
-          "for now.");
+      TI_WARN("Out-of-bound access checking is not supported on arch={}",
+              arch_name(config.arch));
       config.check_out_of_bound = false;
     }
+  }
+
+  if (arch == Arch::cuda) {
+#if defined(TI_WITH_CUDA)
+    int num_SMs;
+    CUDADriver::get_instance().device_get_attribute(
+        &num_SMs, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, nullptr);
+    int query_max_block_dim;
+    CUDADriver::get_instance().device_get_attribute(
+        &query_max_block_dim, CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X, nullptr);
+
+    if (config.max_block_dim == 0) {
+      config.max_block_dim = query_max_block_dim;
+    }
+
+    if (config.saturating_grid_dim == 0) {
+      // each SM can have 16-32 resident blocks
+      config.saturating_grid_dim = num_SMs * 32;
+    }
+#endif
+  }
+
+  if (arch_is_cpu(arch)) {
+    config.max_block_dim = 1024;
   }
 
   stat.clear();
@@ -143,13 +201,20 @@ FunctionType Program::compile(Kernel &kernel) {
     auto codegen = KernelCodeGen::create(kernel.arch, &kernel);
     ret = codegen->compile();
   } else if (kernel.arch == Arch::metal) {
+    metal::CodeGen::Config cgen_config;
+    cgen_config.allow_simdgroup =
+        metal::EnvConfig::instance().is_simdgroup_enabled();
     metal::CodeGen codegen(&kernel, metal_kernel_mgr_.get(),
-                           &metal_compiled_structs_.value());
+                           &metal_compiled_structs_.value(), cgen_config);
     ret = codegen.compile();
   } else if (kernel.arch == Arch::opengl) {
     opengl::OpenglCodeGen codegen(kernel.name, &opengl_struct_compiled_.value(),
                                   opengl_kernel_launcher_.get());
     ret = codegen.compile(*this, kernel);
+#ifdef TI_WITH_CC
+  } else if (kernel.arch == Arch::cc) {
+    ret = cccp::compile_kernel(&kernel);
+#endif
   } else {
     TI_NOT_IMPLEMENTED;
   }
@@ -201,12 +266,26 @@ void Program::initialize_runtime_system(StructCompiler *scomp) {
   auto snodes = scomp->snodes;
   int root_id = snode_root->id;
 
-  TI_TRACE("Allocating data structure of size {} B", scomp->root_size);
+  // A buffer of random states, one per CUDA thread
+  int num_rand_states = 0;
 
-  runtime->call<void *, void *, std::size_t, std::size_t, void *, void *,
+  if (config.arch == Arch::cuda) {
+#if defined(TI_WITH_CUDA)
+    // It is important to make sure that every CUDA thread has its own random
+    // state so that we do not need expensive per-state locks.
+    num_rand_states = config.saturating_grid_dim * config.max_block_dim;
+#else
+    TI_NOT_IMPLEMENTED
+#endif
+  }
+
+  TI_TRACE("Allocating data structure of size {} B", scomp->root_size);
+  TI_TRACE("Allocating {} random states (used by CUDA only)", num_rand_states);
+
+  runtime->call<void *, void *, std::size_t, std::size_t, void *, int, void *,
                 void *, void *>("runtime_initialize", result_buffer, this,
                                 (std::size_t)scomp->root_size, prealloc_size,
-                                preallocated_device_buffer,
+                                preallocated_device_buffer, num_rand_states,
                                 (void *)&taichi_allocate_aligned,
                                 (void *)std::printf, (void *)std::vsnprintf);
 
@@ -244,7 +323,7 @@ void Program::initialize_runtime_system(StructCompiler *scomp) {
           "runtime_NodeAllocator_initialize", rt, i, node_size);
       TI_TRACE("Allocating ambient element for snode {} (node size {})",
                snodes[i]->id, node_size);
-      runtime->call<void *, int>("runtime_allocate_ambient", rt, i);
+      runtime->call<void *, int>("runtime_allocate_ambient", rt, i, node_size);
     }
   }
 
@@ -255,14 +334,16 @@ void Program::initialize_runtime_system(StructCompiler *scomp) {
 
     runtime->call<void *, void *>("LLVMRuntime_set_assert_failed", llvm_runtime,
                                   (void *)assert_failed_host);
-    // Profiler functions can only be called on host kernels
+  }
+  if (arch_is_cpu(config.arch)) {
+    // Profiler functions can only be called on CPU kernels
     runtime->call<void *, void *>("LLVMRuntime_set_profiler", llvm_runtime,
                                   profiler.get());
     runtime->call<void *, void *>("LLVMRuntime_set_profiler_start",
                                   llvm_runtime,
-                                  (void *)&ProfilerBase::profiler_start);
+                                  (void *)&KernelProfilerBase::profiler_start);
     runtime->call<void *, void *>("LLVMRuntime_set_profiler_stop", llvm_runtime,
-                                  (void *)&ProfilerBase::profiler_stop);
+                                  (void *)&KernelProfilerBase::profiler_stop);
   }
 }
 
@@ -304,22 +385,70 @@ void Program::materialize_layout() {
              opengl_struct_compiled_->root_size);
     opengl_kernel_launcher_ = std::make_unique<opengl::GLSLLauncher>(
         opengl_struct_compiled_->root_size);
+#ifdef TI_WITH_CC
+  } else if (config.arch == Arch::cc) {
+    cc_program->compile_layout(snode_root.get());
+#endif
   }
 }
 
 void Program::check_runtime_error() {
-  TI_ASSERT(arch_is_cpu(config.arch));
   synchronize();
   auto tlctx = llvm_context_host.get();
+  if (llvm_context_device) {
+    // In case there is a standalone device context (e.g. CUDA without unified
+    // memory), use the device context instead.
+    tlctx = llvm_context_device.get();
+  }
   auto runtime_jit_module = tlctx->runtime_jit_module;
-  runtime_jit_module->call<void *>("runtime_retrieve_error_code", llvm_runtime);
+  runtime_jit_module->call<void *>("runtime_retrieve_and_reset_error_code",
+                                   llvm_runtime);
   auto error_code = fetch_result<int64>(taichi_result_buffer_error_id);
+
   if (error_code) {
-    runtime_jit_module->call<void *>("runtime_retrieve_error_message",
-                                     llvm_runtime);
-    auto error_message = fetch_result<char *>(taichi_result_buffer_error_id);
+    std::string error_message_template;
+
+    // Here we fetch the error_message_template char by char.
+    // This is not efficient, but fortunately we only need to do this when an
+    // assertion fails. Note that we may not have unified memory here, so using
+    // "fetch_result" that works across device/host memroy is necessary.
+    for (int i = 0;; i++) {
+      runtime_jit_module->call<void *>("runtime_retrieve_error_message",
+                                       llvm_runtime, i);
+      auto c = fetch_result<char>(taichi_result_buffer_error_id);
+      error_message_template += c;
+      if (c == '\0') {
+        break;
+      }
+    }
+
     if (error_code == 1) {
-      TI_ERROR("Assertion failure: {}", error_message);
+      std::string error_message_formatted;
+      int argument_id = 0;
+      for (int i = 0; i < (int)error_message_template.size(); i++) {
+        if (error_message_template[i] != '%') {
+          error_message_formatted += error_message_template[i];
+        } else {
+          auto dtype = error_message_template[i + 1];
+          runtime_jit_module->call<void *>(
+              "runtime_retrieve_error_message_argument", llvm_runtime,
+              argument_id);
+          auto argument = fetch_result<uint64>(taichi_result_buffer_error_id);
+          if (dtype == 'd') {
+            error_message_formatted += fmt::format(
+                "{}", taichi_union_cast_with_different_sizes<int32>(argument));
+          } else if (dtype == 'f') {
+            error_message_formatted += fmt::format(
+                "{}",
+                taichi_union_cast_with_different_sizes<float32>(argument));
+          } else {
+            TI_ERROR("Data type identifier %{} is not supported", dtype);
+          }
+          argument_id += 1;
+          i++;  // skip the dtype char
+        }
+      }
+      TI_ERROR("Assertion failure: {}", error_message_formatted);
     } else {
       TI_NOT_IMPLEMENTED
     }
@@ -336,7 +465,7 @@ void Program::synchronize() {
 #endif
     } else if (config.arch == Arch::metal) {
       metal_kernel_mgr_->synchronize();
-    } else if (config.async == true) {
+    } else if (config.async_mode) {
       async_engine->synchronize();
     }
     sync = true;
@@ -439,6 +568,8 @@ Arch Program::get_snode_accessor_arch() {
     return Arch::cuda;
   } else if (config.arch == Arch::metal) {
     return Arch::metal;
+  } else if (config.arch == Arch::cc) {
+    return Arch::cc;
   } else {
     return get_host_arch();
   }
@@ -488,6 +619,10 @@ Kernel &Program::get_snode_writer(SNode *snode) {
 uint64 Program::fetch_result_uint64(int i) {
   uint64 ret;
   auto arch = config.arch;
+  sync = false;
+  // Runtime calls that set result buffer don't execute sync=false, so we have
+  // to set it here otherwise synchronize() does nothing.
+  // TODO: systematically fix this.
   synchronize();
   if (arch == Arch::cuda) {
 #if defined(TI_WITH_CUDA)
@@ -555,6 +690,14 @@ void Program::finalize() {
 
 void Program::launch_async(Kernel *kernel) {
   async_engine->launch(kernel);
+}
+
+int Program::default_block_dim() const {
+  if (arch_is_cpu(config.arch)) {
+    return config.default_cpu_block_dim;
+  } else {
+    return config.default_gpu_block_dim;
+  }
 }
 
 Program::~Program() {
